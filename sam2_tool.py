@@ -1,7 +1,7 @@
 # Imports supplémentaires pour Google Drive
-from pydrive.auth import GoogleAuth
-from pydrive.drive import GoogleDrive
-from oauth2client.client import GoogleCredentials
+#from pydrive.auth import GoogleAuth
+#from pydrive.drive import GoogleDrive
+#from oauth2client.client import GoogleCredentials
 
 # Imports pour SAM2
 import torch
@@ -16,30 +16,49 @@ import io
 import base64
 import gradio as gr
 import webbrowser
+import glob
+from pathlib import Path
+import traceback
 
 # Ajouter ces constantes au début du fichier, après les imports
+LOCAL_MODEL_FOLDER = "models"  # Dossier local pour les modèles
+MODEL_FILENAME = "sam2_b.pt"  # Nom du fichier modèle
+INITIAL_LOCAL_FOLDER = "images"  # Dossier initial pour les images
 GOOGLE_DRIVE_MODEL_FOLDER = "SAM2_Models"  # Nom du dossier pour les modèles sur Drive
-MODEL_FILENAME = "sam2_b.pt"  # Nom du fichier modèle sur Drive
 INITIAL_DRIVE_FOLDER = "My Drive/MSPR/empreintes"  # Chemin complet par défaut
+
+def show_mask(mask, ax):
+    """Affiche un masque sur un axe matplotlib"""
+    color = np.array([30/255, 144/255, 255/255, 0.6])  # Bleu dodger transparent
+    h, w = mask.shape[-2:]
+    mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
+    ax.imshow(mask_image)
 
 def init_sam2_model():
     """Initialise le modèle SAM2"""
     try:
         from sam2.build_sam import build_sam2_hf
         from sam2.sam2_image_predictor import SAM2ImagePredictor
+        import traceback
         
-        # Utiliser le modèle local
-        model_path = "sam2_b.pt"  # Chemin vers votre fichier .pt
-        if not os.path.exists(model_path):
-            raise Exception(f"Modèle non trouvé : {model_path}")
-            
-        print(f"Chargement du modèle SAM2 depuis {model_path}")
-        model = build_sam2_hf(model_id=model_path)
-        predictor = SAM2ImagePredictor(model)
-        print("Modèle SAM2 chargé avec succès")
-        return predictor
+        # Utiliser un identifiant de modèle Hugging Face au lieu d'un chemin local
+        model_id = "facebook/sam2-hiera-large"  # Identifiant du modèle SAM2 base sur Hugging Face
+        
+        print(f"Chargement du modèle SAM2 depuis Hugging Face: {model_id}")
+        try:
+            # Utiliser build_sam2_hf avec un identifiant de modèle Hugging Face et forcer l'utilisation du CPU
+            model = build_sam2_hf(model_id=model_id, device="cpu")
+            predictor = SAM2ImagePredictor(model)
+            print("Modèle SAM2 chargé avec succès")
+            return predictor
+        except Exception as model_error:
+            print(f"Erreur détaillée lors du chargement du modèle:")
+            traceback.print_exc()
+            raise model_error
     except Exception as e:
         print(f"Erreur lors de l'initialisation du modèle SAM2: {str(e)}")
+        print("Trace d'erreur complète:")
+        traceback.print_exc()
         return None
 
 def generate_masks_from_points(image, points, point_labels):
@@ -49,14 +68,25 @@ def generate_masks_from_points(image, points, point_labels):
         if predictor is None:
             raise Exception("Impossible d'initialiser le modèle SAM2")
         
+        print("Initialisation du modèle réussie, configuration de l'image...")
         predictor.set_image(image)
-        masks, scores, logits = predictor.predict(
-            point_coords=np.array(points),
-            point_labels=np.array(point_labels)
-        )
-        return masks, scores
+        print("Image configurée, prédiction des masques...")
+        
+        try:
+            masks, scores, logits = predictor.predict(
+                point_coords=np.array(points),
+                point_labels=np.array(point_labels)
+            )
+            print(f"Prédiction réussie: {len(masks)} masques générés")
+            return masks, scores
+        except Exception as predict_error:
+            print(f"Erreur détaillée lors de la prédiction des masques:")
+            traceback.print_exc()
+            raise predict_error
     except Exception as e:
         print(f"Erreur lors de la génération des masques: {str(e)}")
+        print("Trace d'erreur complète:")
+        traceback.print_exc()
         return None, None
 
 class Catalog:
@@ -95,7 +125,6 @@ catalog = Catalog()
 
 def cleanup_temp_files():
     """Nettoie les fichiers temporaires"""
-    import glob
     for f in glob.glob("temp_*"):
         try:
             os.remove(f)
@@ -106,83 +135,80 @@ def cleanup_temp_files():
 def process_image_with_sam2(image_path):
     """Traite l'image avec SAM2"""
     try:
+        print(f"Chargement de l'image depuis {image_path}...")
         image = plt.imread(image_path)
+        print(f"Image chargée avec succès: forme {image.shape}, type {image.dtype}")
         return image
     except Exception as e:
         print(f"Erreur lors du traitement de l'image: {str(e)}")
+        print("Trace d'erreur complète:")
+        traceback.print_exc()
         return None
 
-def load_drive_folders(state):
-    """Charge le contenu du dossier initial sur Google Drive"""
+def load_local_folders(state):
+    """Charge le contenu du dossier local"""
     try:
-        if state.drive is None:
-            state.drive = state.init_google_drive()
-            if state.drive is None:
-                return (
-                    "Non connecté",
-                    [],
-                    "Erreur: Configuration Google Drive manquante"
-                )
+        # Vérifier si le dossier des images existe, sinon le créer
+        if not os.path.exists(INITIAL_LOCAL_FOLDER):
+            os.makedirs(INITIAL_LOCAL_FOLDER)
+            print(f"Dossier {INITIAL_LOCAL_FOLDER} créé")
         
-        print("Recherche du dossier MSPR...")
-        file_list = state.drive.ListFile({'q': "title='MSPR' and mimeType='application/vnd.google-apps.folder' and 'root' in parents and trashed=false"}).GetList()
+        # Mettre à jour le dossier courant
+        current_folder = state.current_folder_path or INITIAL_LOCAL_FOLDER
+        print(f"Chargement du dossier local: {current_folder}")
         
-        if not file_list:
-            print("Dossier MSPR non trouvé")
+        # Vérifier que le dossier existe
+        if not os.path.exists(current_folder):
+            print(f"Dossier {current_folder} non trouvé")
             return (
-                INITIAL_DRIVE_FOLDER,
+                INITIAL_LOCAL_FOLDER,
                 [],
-                "Erreur: Dossier MSPR non trouvé dans My Drive"
+                f"Erreur: Dossier {current_folder} non trouvé"
             )
         
-        mspr_folder = file_list[0]
-        print(f"Dossier MSPR trouvé avec ID: {mspr_folder['id']}")
+        # Lister le contenu du dossier
+        items = os.listdir(current_folder)
         
-        print("Recherche du dossier empreintes...")
-        file_list = state.drive.ListFile({'q': f"title='empreintes' and mimeType='application/vnd.google-apps.folder' and '{mspr_folder['id']}' in parents and trashed=false"}).GetList()
+        # Séparer les dossiers et les fichiers images
+        folders = []
+        files = []
         
-        if not file_list:
-            print("Dossier empreintes non trouvé")
-            return (
-                INITIAL_DRIVE_FOLDER,
-                [],
-                "Erreur: Dossier empreintes non trouvé dans MSPR"
-            )
+        for item in items:
+            item_path = os.path.join(current_folder, item)
+            if os.path.isdir(item_path):
+                folders.append(item)
+            elif os.path.isfile(item_path) and item.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.gif')):
+                files.append(item)
         
-        empreintes_folder = file_list[0]
-        state.current_folder_id = empreintes_folder['id']
-        print(f"Dossier empreintes trouvé avec ID: {state.current_folder_id}")
-        
-        print("Listage du contenu du dossier empreintes...")
-        file_list = state.drive.ListFile({'q': f"'{state.current_folder_id}' in parents and trashed=false"}).GetList()
-        
-        folders = [f for f in file_list if f['mimeType'] == 'application/vnd.google-apps.folder']
-        files = [f for f in file_list if f['mimeType'].startswith('image/')]
+        # Trier les dossiers et fichiers par ordre alphabétique
+        folders.sort(key=str.lower)
+        files.sort(key=str.lower)
         
         print(f"Trouvé {len(folders)} dossiers et {len(files)} fichiers")
         
+        # Créer la liste des choix
         choices = []
-        for folder in sorted(folders, key=lambda x: x['title'].lower()):
-            choice = f"{folder['title']} (dossier)"
+        for folder in folders:
+            choice = f"{folder} (dossier)"
             print(f"Ajout du dossier: {choice}")
             choices.append(choice)
             
-        for file in sorted(files, key=lambda x: x['title'].lower()):
-            choice = f"{file['title']} (fichier)"
+        for file in files:
+            choice = f"{file} (fichier)"
             print(f"Ajout du fichier: {choice}")
             choices.append(choice)
         
         print(f"Liste finale des choix: {choices}")
         
         return (
-            "My Drive/MSPR/empreintes",
+            current_folder,
             choices,
-            f"Dossier My Drive/MSPR/empreintes chargé avec succès ({len(folders)} dossiers, {len(files)} fichiers)"
+            f"Dossier {current_folder} chargé avec succès ({len(folders)} dossiers, {len(files)} fichiers)"
         )
         
     except Exception as e:
         print(f"Erreur lors du chargement des dossiers: {str(e)}")
-        return INITIAL_DRIVE_FOLDER, [], f"Erreur: {str(e)}"
+        return INITIAL_LOCAL_FOLDER, [], f"Erreur: {str(e)}"
 
 # Interface Gradio pour l'application
 def create_segmentation_app():
@@ -194,22 +220,9 @@ def create_segmentation_app():
             self.current_masks = None
             self.current_scores = None
             self.selected_mask_idx = 0
-            self.current_folder_id = None
+            self.current_folder_path = INITIAL_LOCAL_FOLDER
             self.catalog = Catalog()
-            self.drive = None
             self.predictor = None
-
-        def init_google_drive(self):
-            """Initialise la connexion à Google Drive"""
-            try:
-                gauth = GoogleAuth()
-                gauth.LocalWebserverAuth()
-                self.drive = GoogleDrive(gauth)
-                print("Connexion à Google Drive établie avec succès")
-                return self.drive
-            except Exception as e:
-                print(f"Erreur lors de la connexion à Google Drive: {str(e)}")
-                return None
 
     state = AppState()
     
@@ -227,60 +240,52 @@ def create_segmentation_app():
             name = item_name.split(" (")[0]
             is_folder = "(dossier)" in item_name
             
-            print(f"Recherche de {name} ({'dossier' if is_folder else 'fichier'})")  # Debug
+            print(f"Recherche de {name} ({'dossier' if is_folder else 'fichier'})")
             
-            # Chercher l'item dans les contenus actuels
-            file_list = state.drive.ListFile({'q': f"'{state.current_folder_id}' in parents and trashed=false"}).GetList()
+            # Construire le chemin complet
+            current_path = state.current_folder_path
+            item_path = os.path.join(current_path, name)
+            print(f"Chemin complet: {item_path}")
             
             if is_folder:
-                folder = next((f for f in file_list if f['title'] == name and f['mimeType'] == 'application/vnd.google-apps.folder'), None)
-                if folder:
-                    state.current_folder_id = folder['id']
-                    new_list = state.drive.ListFile({'q': f"'{state.current_folder_id}' in parents and trashed=false"}).GetList()
+                # Vérifier que c'est bien un dossier
+                if os.path.isdir(item_path):
+                    # Mettre à jour le dossier courant
+                    state.current_folder_path = item_path
+                    print(f"Dossier valide, mise à jour du dossier courant: {state.current_folder_path}")
                     
-                    # Séparer et trier les dossiers et fichiers
-                    folders = sorted(
-                        [f for f in new_list if f['mimeType'] == 'application/vnd.google-apps.folder'],
-                        key=lambda x: x['title'].lower()
-                    )
-                    files = sorted(
-                        [f for f in new_list if f['mimeType'].startswith('image/')],
-                        key=lambda x: x['title'].lower()
-                    )
-                    
-                    # Créer la liste des choix
-                    choices = []
-                    for f in folders:
-                        choices.append(f"{f['title']} (dossier)")
-                    for f in files:
-                        choices.append(f"{f['title']} (fichier)")
-                    
-                    return choices, None, f"Dossier '{name}' ouvert ({len(folders)} dossiers, {len(files)} fichiers)"
+                    # Charger le contenu du nouveau dossier
+                    new_path, choices, msg = load_local_folders(state)
+                    return choices, None, f"Dossier '{name}' ouvert"
+                else:
+                    print(f"Erreur: {item_path} n'est pas un dossier valide")
+                    return [], None, f"'{name}' n'est pas un dossier valide"
             else:
-                file = next((f for f in file_list if f['title'] == name and f['mimeType'].startswith('image/')), None)
-                if file:
-                    # Télécharger et afficher l'image
-                    temp_path = f"temp_{file['title']}"
-                    file.GetContentFile(temp_path)
-                    
+                # Vérifier que c'est bien un fichier image
+                if os.path.isfile(item_path) and name.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.gif')):
+                    print(f"Fichier image valide: {item_path}")
                     # Traiter l'image
-                    state.current_image_path = temp_path
-                    state.current_image = process_image_with_sam2(temp_path)
+                    state.current_image_path = item_path
+                    state.current_image = process_image_with_sam2(item_path)
                     
                     if state.current_image is not None:
                         return None, state.current_image, f"Image '{name}' chargée"
                     else:
+                        print(f"Erreur: Impossible de traiter l'image {item_path}")
                         return None, None, f"Erreur lors du chargement de l'image '{name}'"
-            
-            return [], None, f"Élément '{name}' non trouvé"
+                else:
+                    print(f"Erreur: {item_path} n'est pas un fichier image valide")
+                    return [], None, f"'{name}' n'est pas un fichier image valide"
             
         except Exception as e:
             print(f"Erreur lors de la sélection de l'item: {str(e)}")
+            print("Trace d'erreur complète:")
+            traceback.print_exc()
             return [], None, f"Erreur: {str(e)}"
 
     def load_folders_wrapper():
-        """Wrapper pour load_drive_folders qui inclut state"""
-        return load_drive_folders(state)
+        """Wrapper pour load_local_folders qui inclut state"""
+        return load_local_folders(state)
 
     def segment_from_clicks_wrapper(image, evt: gr.SelectData):
         """Wrapper pour segment_from_clicks qui inclut state"""
@@ -438,7 +443,7 @@ def create_segmentation_app():
             return None, f"Erreur: {str(e)}"
 
     # Charger les dossiers au démarrage
-    initial_path, initial_contents, status_msg = load_drive_folders(state)
+    initial_path, initial_contents, status_msg = load_local_folders(state)
     
     with gr.Blocks(css="""
         /* Style pour la liste déroulante */
@@ -462,11 +467,11 @@ def create_segmentation_app():
 
         with gr.Row():
             with gr.Column(scale=1):
-                # Navigation Drive
-                load_drive_btn = gr.Button("Charger les dossiers", variant="primary")
+                # Navigation locale
+                load_folders_btn = gr.Button("Charger les dossiers", variant="primary")
                 current_path = gr.Textbox(
                     label="Chemin actuel",
-                    value=INITIAL_DRIVE_FOLDER,
+                    value=INITIAL_LOCAL_FOLDER,
                     interactive=False  # Le chemin n'est pas modifiable directement
                 )
                 folder_browser = gr.Radio(
@@ -509,7 +514,7 @@ def create_segmentation_app():
                 export_btn = gr.Button("Exporter le catalogue", variant="secondary")
 
         # Événements
-        load_drive_btn.click(
+        load_folders_btn.click(
             fn=load_folders_wrapper,
             inputs=[],
             outputs=[current_path, folder_browser, status]
@@ -550,23 +555,18 @@ app.launch(debug=True)
 # Instructions d'utilisation
 print("""
 Instructions d'utilisation:
-1. Lancez l'application
-2. Cliquez sur 'Charger les dossiers' pour accéder à vos images locales
-3. Naviguez dans la structure de vos dossiers et sélectionnez une image d'empreinte
-4. Cliquez sur un objet parasite dans l'image pour le segmenter avec SAM
-5. Utilisez le curseur pour sélectionner le meilleur masque parmi les options
-6. Entrez une étiquette pour l'objet parasite (ex: 'poussière', 'cheveu', etc.)
-7. Cliquez sur 'Ajouter au catalogue' pour sauvegarder l'objet
-8. Répétez pour tous les objets parasites dans l'image
-9. Utilisez 'Exporter le catalogue' pour créer une archive ZIP de votre catalogue
+1. Placez votre modèle SAM2 (sam2_b.pt) dans le dossier 'models'
+2. Placez vos images dans le dossier 'images'
+3. Lancez l'application
+4. Cliquez sur 'Charger les dossiers' pour accéder à vos images locales
+5. Naviguez dans la structure de vos dossiers et sélectionnez une image d'empreinte
+6. Cliquez sur un objet parasite dans l'image pour le segmenter avec SAM
+7. Utilisez le curseur pour sélectionner le meilleur masque parmi les options
+8. Entrez une étiquette pour l'objet parasite (ex: 'poussière', 'cheveu', etc.)
+9. Cliquez sur 'Ajouter au catalogue' pour sauvegarder l'objet
+10. Répétez pour tous les objets parasites dans l'image
+11. Utilisez 'Exporter le catalogue' pour créer une archive ZIP de votre catalogue
 
 Note: Le catalogue sera enregistré dans le dossier 'parasite_catalog' de votre répertoire courant.
 Ce catalogue pourra être utilisé ultérieurement pour entraîner votre propre modèle de détection.
 """)
-
-def show_mask(mask, ax):
-    """Affiche un masque sur un axe matplotlib"""
-    color = np.array([30/255, 144/255, 255/255, 0.6])  # Bleu dodger transparent
-    h, w = mask.shape[-2:]
-    mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
-    ax.imshow(mask_image)
