@@ -3,3 +3,6 @@ __pycahche__
 client_secrets.json
 mycreds.txt
 sam2_b.pt
+models/
+images/
+.idea/

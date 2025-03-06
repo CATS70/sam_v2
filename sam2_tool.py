@@ -48,9 +48,9 @@ def init_sam2_model():
         try:
             # Utiliser build_sam2_hf avec un identifiant de modèle Hugging Face et forcer l'utilisation du CPU
             model = build_sam2_hf(model_id=model_id, device="cpu")
-            predictor = SAM2ImagePredictor(model)
-            print("Modèle SAM2 chargé avec succès")
-            return predictor
+        predictor = SAM2ImagePredictor(model)
+        print("Modèle SAM2 chargé avec succès")
+        return predictor
         except Exception as model_error:
             print(f"Erreur détaillée lors du chargement du modèle:")
             traceback.print_exc()
@@ -73,12 +73,12 @@ def generate_masks_from_points(image, points, point_labels):
         print("Image configurée, prédiction des masques...")
         
         try:
-            masks, scores, logits = predictor.predict(
-                point_coords=np.array(points),
-                point_labels=np.array(point_labels)
-            )
+        masks, scores, logits = predictor.predict(
+            point_coords=np.array(points),
+            point_labels=np.array(point_labels)
+        )
             print(f"Prédiction réussie: {len(masks)} masques générés")
-            return masks, scores
+        return masks, scores
         except Exception as predict_error:
             print(f"Erreur détaillée lors de la prédiction des masques:")
             traceback.print_exc()
